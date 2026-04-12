@@ -20,13 +20,13 @@ TERMUX_PACKAGE_NAME="com.termux"
 export TERMUX_PACKAGE_NAME
 
 # The package name of the intended application
-COTG_PACKAGE_NAME="com.itsaky.androidide"
+COTG_PACKAGE_NAME="android.zero.studio"
 export COTG_PACKAGE_NAME
 
 # Path to the public key
 # this is used for signature verification
 # while installing packages
-COTG_GPG_KEY="$script_dir/adfa-dev-team.gpg"
+COTG_GPG_KEY="$script_dir/public_ZeroStudio.gpg"
 export COTG_GPG_KEY
 
 # Configure build environment variables
