@@ -99,7 +99,7 @@ jobs:
             -a "${{ matrix.arch }}" \
             -p "android.zero.studio" \
             -r "${REPO_URL}" \
-            -s adfa-dev-team.gpg
+            -s public_ZeroStudio.gpg
 
       - name: Rename deb files (remove invalid characters)
         if: always()
