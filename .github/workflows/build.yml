@@ -1,1 +1,286 @@
+name: Build & Publish Packages
 
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish packages after build?'
+        required: false
+        default: 'false'
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    container:
+      image: ghcr.io/termux/package-builder:latest
+      env:
+        ANDROID_HOME: /github/home/lib/android-sdk
+        ANDROID_SDK_ROOT: /github/home/lib/android-sdk
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - aarch64
+          - arm
+
+    env:
+      REPO_URL: "https://msmt2018.github.io/terminal-packages/apt/termux-main"
+      NDK_VERSION: "r29"
+      NDK_DIR: "/github/home/lib/android-ndk-r29"
+      ANDROID_HOME: "/github/home/lib/android-sdk"
+      ANDROID_SDK_ROOT: "/github/home/lib/android-sdk"
+
+    steps:
+      - name: Checkout repository (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Android NDK and SDK
+        shell: bash
+        run: |
+          mkdir -p /github/home/lib
+
+          # ── NDK ──
+          if [ ! -d "${NDK_DIR}" ]; then
+            echo "Downloading Android NDK ${NDK_VERSION}..."
+            curl -fLo /tmp/ndk.zip \
+              "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+            unzip -q /tmp/ndk.zip -d /github/home/lib/
+            rm /tmp/ndk.zip
+            echo "NDK installed."
+          fi
+
+          # ── SDK ──
+          if [ ! -d "${ANDROID_HOME}/cmdline-tools/latest" ]; then
+            echo "Downloading Android SDK command-line tools..."
+            curl -fLo /tmp/sdk-tools.zip \
+              "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+            mkdir -p "${ANDROID_HOME}/cmdline-tools"
+            unzip -q /tmp/sdk-tools.zip -d "${ANDROID_HOME}/cmdline-tools/"
+            mv "${ANDROID_HOME}/cmdline-tools/cmdline-tools" \
+               "${ANDROID_HOME}/cmdline-tools/latest" 2>/dev/null || true
+            rm /tmp/sdk-tools.zip
+          fi
+
+          export PATH="${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${PATH}"
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platform-tools" "build-tools;35.0.0" "platforms;android-35" > /dev/null 2>&1 || true
+
+          # Escreve local.properties para que o Gradle encontre o SDK
+          echo "sdk.dir=${ANDROID_HOME}" > /github/home/.termux-build/termux-tools/local.properties 2>/dev/null || true
+
+          echo "Setup completo!"
+          echo "ANDROID_HOME=${ANDROID_HOME}"
+          ls "${ANDROID_HOME}" || true
+
+      - name: Build packages
+        shell: bash
+        run: |
+          mkdir -p output
+          export ANDROID_HOME=/github/home/lib/android-sdk
+          export ANDROID_SDK_ROOT=/github/home/lib/android-sdk
+          bash -x build.sh \
+            -a "${{ matrix.arch }}" \
+            -p "android.zero.studio" \
+            -r "${REPO_URL}" \
+            -s adfa-dev-team.gpg
+
+      - name: Rename deb files (remove invalid characters)
+        if: always()
+        shell: bash
+        run: |
+          find "output/${{ matrix.arch }}/" -name "*.deb" -print0 | while IFS= read -r -d '' f; do
+            dir=$(dirname "$f")
+            base=$(basename "$f")
+            newbase="${base//:/_}"
+            if [ "$base" != "$newbase" ]; then
+              echo "Renaming: $base -> $newbase"
+              mv "$f" "$dir/$newbase"
+            fi
+          done
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: packages-${{ matrix.arch }}
+          path: output/${{ matrix.arch }}/
+          retention-days: 7
+
+  generate-apt-repo:
+    name: Generate APT Repository
+    runs-on: ubuntu-latest
+    needs: build
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish == 'true')
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download aarch64 packages
+        uses: actions/download-artifact@v4
+        with:
+          name: packages-aarch64
+          path: output/aarch64/
+
+      - name: Download arm packages
+        uses: actions/download-artifact@v4
+        with:
+          name: packages-arm
+          path: output/arm/
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gnupg wget ca-certificates python3
+
+      - name: Import GPG signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          echo "$GPG_PRIVATE_KEY" | base64 -d | gpg --batch --import
+          gpg --list-secret-keys
+
+      - name: Generate APT repository
+        run: bash generate-apt-repo.sh
+
+      - name: Sign the APT repository
+        env:
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+          GPG_KEY_PASSPHRASE: ${{ secrets.GPG_KEY_PASSPHRASE }}
+        run: |
+          echo "$GPG_KEY_PASSPHRASE" | gpg \
+            --batch --yes \
+            --passphrase-fd 0 \
+            --pinentry-mode loopback \
+            --digest-algo SHA256 \
+            --clearsign \
+            -u "${GPG_KEY_ID}" \
+            -o ./output/repo/dists/stable/InRelease \
+            ./output/repo/dists/stable/Release
+
+      - name: Upload signed APT repository
+        uses: actions/upload-artifact@v4
+        with:
+          name: apt-repo
+          path: output/repo/
+          retention-days: 7
+
+  publish:
+    name: Publish Repository
+    runs-on: ubuntu-latest
+    needs: generate-apt-repo
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish == 'true')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout packages branch
+        uses: actions/checkout@v4
+        with:
+          ref: packages
+          path: packages-branch
+          fetch-depth: 0
+
+      - name: Download signed APT repository
+        uses: actions/download-artifact@v4
+        with:
+          name: apt-repo
+          path: apt-repo/
+
+      - name: Copy repository files to packages branch
+        run: |
+          mkdir -p packages-branch/apt/termux-main
+          cp -r apt-repo/* packages-branch/apt/termux-main/
+
+      - name: Commit & push
+        working-directory: packages-branch
+        run: |
+          git config user.email "ci@fl-ide.dev"
+          git config user.name "FL IDE CI"
+          git add apt/
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: apt repo update for ${{ github.sha }}"
+            git push origin packages
+          else
+            echo "No changes to publish."
+          fi
+
+  bootstrap:
+    name: Generate Bootstrap Archives
+    runs-on: ubuntu-latest
+    needs: generate-apt-repo
+    if: github.ref == 'refs/heads/main'
+    container:
+      image: ghcr.io/termux/package-builder:latest
+
+    env:
+      NDK_VERSION: "r29"
+      NDK_DIR: "/github/home/lib/android-ndk-r29"
+
+    steps:
+      - name: Checkout repository (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Android NDK
+        shell: bash
+        run: |
+          mkdir -p /github/home/lib
+          if [ ! -d "${NDK_DIR}" ]; then
+            curl -fLo /tmp/ndk.zip \
+              "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+            unzip -q /tmp/ndk.zip -d /github/home/lib/
+            rm /tmp/ndk.zip
+          fi
+
+      - name: Download aarch64 packages
+        uses: actions/download-artifact@v4
+        with:
+          name: packages-aarch64
+          path: output/aarch64/
+
+      - name: Download arm packages
+        uses: actions/download-artifact@v4
+        with:
+          name: packages-arm
+          path: output/arm/
+
+      - name: Generate bootstrap archives (debug)
+        shell: bash
+        run: bash generate-bootstrap-archive.sh
+
+      - name: Generate bootstrap archives (release)
+        shell: bash
+        run: bash generate-bootstrap-archive.sh -g
+
+      - name: Upload bootstrap archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-archives
+          path: |
+            output/bootstrap-*.zip
+            output/bootstrap-*.zip.9
+          retention-days: 30
