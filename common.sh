@@ -44,7 +44,7 @@ export COTG_REPO
 # All supported CPU ABIs
 # Must begin and end with spaces
 # Must be separated with spaces
-COTG_ALL_ARCHS=" aarch64 arm "
+COTG_ALL_ARCHS=" aarch64 arm x86_64 "
 export COTG_ALL_ARCHS
 
 # The base output directory
