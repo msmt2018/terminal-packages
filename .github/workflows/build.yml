@@ -95,6 +95,10 @@ jobs:
           mkdir -p output
           export ANDROID_HOME=/github/home/lib/android-sdk
           export ANDROID_SDK_ROOT=/github/home/lib/android-sdk
+
+          # 限制编译进程数为 1，防止 OOM
+          export TERMUX_MAKE_PROCESSES=1 
+
           bash -x build.sh \
             -a "${{ matrix.arch }}" \
             -p "android.zero.studio" \
