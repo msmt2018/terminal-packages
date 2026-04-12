@@ -1,0 +1,153 @@
+name: Generate Bootstrap Archives
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bootstrap:
+    name: Generate Bootstrap (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/termux/package-builder:latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - aarch64
+          - arm
+
+    env:
+      NDK_VERSION: "r29"
+      NDK_DIR: "/github/home/lib/android-ndk-r29"
+      REPO_URL: "https://msmt2018.github.io/terminal-packages/apt/termux-main"
+
+    steps:
+      - name: Checkout repository (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Android NDK
+        shell: bash
+        run: |
+          mkdir -p /github/home/lib
+          if [ ! -d "${NDK_DIR}" ]; then
+            curl -fLo /tmp/ndk.zip \
+              "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+            unzip -q /tmp/ndk.zip -d /github/home/lib/
+            rm /tmp/ndk.zip
+          fi
+
+      - name: Create output directories
+        shell: bash
+        run: mkdir -p output/${{ matrix.arch }} output/repo
+
+      - name: Create dummy debs and local mirror
+        shell: bash
+        run: |
+          ARCH="${{ matrix.arch }}"
+          MIRROR="/tmp/mirror"
+          mkdir -p "$MIRROR/dists/stable/main/binary-${ARCH}"
+          mkdir -p "$MIRROR/dists/stable/main/binary-all"
+          mkdir -p "$MIRROR/pool/main"
+
+          # Cria .deb vazio para command-not-found
+          for pkg in command-not-found bash-completion; do
+            TMPDIR=$(mktemp -d)
+            mkdir -p "$TMPDIR/DEBIAN"
+            cat > "$TMPDIR/DEBIAN/control" << CTRL
+          Package: ${pkg}
+          Version: 1.0
+          Architecture: ${ARCH}
+          Maintainer: dummy
+          Description: Dummy package
+          CTRL
+            dpkg-deb --build "$TMPDIR" \
+              "$MIRROR/pool/main/${pkg}_1.0_${ARCH}.deb"
+            rm -rf "$TMPDIR"
+            echo "Criado dummy: ${pkg}"
+          done
+
+          # Baixa arquivos do repo real
+          curl -fsSL "${REPO_URL}/dists/stable/Release" \
+            -o "$MIRROR/dists/stable/Release"
+          curl -fsSL "${REPO_URL}/dists/stable/InRelease" \
+            -o "$MIRROR/dists/stable/InRelease"
+          curl -fsSL "${REPO_URL}/dists/stable/main/binary-all/Packages" \
+            -o "$MIRROR/dists/stable/main/binary-all/Packages"
+          curl -fsSL "${REPO_URL}/dists/stable/main/binary-${ARCH}/Packages" \
+            -o "$MIRROR/dists/stable/main/binary-${ARCH}/Packages"
+
+          # Adiciona os dummy debs no Packages index
+          for pkg in command-not-found bash-completion; do
+            DEB="$MIRROR/pool/main/${pkg}_1.0_${ARCH}.deb"
+            SIZE=$(wc -c < "$DEB")
+            SHA256=$(sha256sum "$DEB" | cut -d' ' -f1)
+            cat >> "$MIRROR/dists/stable/main/binary-${ARCH}/Packages" << PKG
+
+          Package: ${pkg}
+          Version: 1.0
+          Architecture: ${ARCH}
+          Maintainer: dummy
+          Installed-Size: 0
+          Description: Dummy package
+          Filename: pool/main/${pkg}_1.0_${ARCH}.deb
+          Size: ${SIZE}
+          SHA256: ${SHA256}
+          PKG
+          done
+
+          echo "=== Packages atualizado ==="
+          grep -A 5 "^Package: bash$" \
+            "$MIRROR/dists/stable/main/binary-${ARCH}/Packages"
+
+          # Inicia servidor local
+          cat > /tmp/server.py << 'PYEOF'
+          import os
+          import urllib.request
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+
+          REAL = os.environ["REPO_URL"]
+          MIRROR = "/tmp/mirror"
+
+          class H(BaseHTTPRequestHandler):
+              def log_message(self, f, *a): pass
+              def do_GET(self):
+                  local = MIRROR + self.path
+                  if os.path.isfile(local):
+                      data = open(local, "rb").read()
+                  else:
+                      try:
+                          data = urllib.request.urlopen(REAL + self.path).read()
+                      except Exception:
+                          self.send_response(404)
+                          self.end_headers()
+                          return
+                  self.send_response(200)
+                  self.send_header("Content-Length", len(data))
+                  self.end_headers()
+                  self.wfile.write(data)
+
+          HTTPServer(("0.0.0.0", 8080), H).serve_forever()
+          PYEOF
+          python3 /tmp/server.py &
+          sleep 2
+          echo "Servidor pronto!"
+
+      - name: Generate bootstrap archive (debug)
+        shell: bash
+        run: bash generate-bootstrap-archive.sh -r "http://localhost:8080"
+
+      - name: Generate bootstrap archive (release)
+        shell: bash
+        run: bash generate-bootstrap-archive.sh -g -r "http://localhost:8080"
+
+      - name: Upload bootstrap archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-${{ matrix.arch }}
+          path: |
+            output/bootstrap-*-${{ matrix.arch }}.zip
+            output/bootstrap-*-${{ matrix.arch }}.zip.9
+          retention-days: 30
